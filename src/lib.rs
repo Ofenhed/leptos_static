@@ -270,7 +270,7 @@ impl StaticRouteGenerator {
         })
     }
 
-    /// Run your app for each
+    /// Run your app for each path and save the output files.
     pub async fn generate(self, options: &LeptosOptions) {
         (self.1)(options).await
     }
