@@ -28,7 +28,7 @@ use std::{
 };
 
 use any_spawner::PinnedFuture;
-use futures::{StreamExt as _, join};
+use futures::StreamExt as _;
 use leptos::{PrefetchLazyFn, WasmSplitManifest, config::LeptosOptions, prelude::*};
 use leptos_integration_utils::{BoxedFnOnce, PinnedStream};
 use leptos_meta::{Link, ServerMetaContext};
@@ -168,15 +168,11 @@ impl StaticRouteGenerator {
         let sc = owner.shared_context().unwrap();
 
         async move {
-            let await_pending = {
-                let sc = sc.clone();
-                async move {
-                    while let Some(pending) = sc.await_deferred() {
-                        pending.await;
-                    }
-                }
-            };
-            let (stream, ()) = join!(stream, await_pending);
+            let stream = stream.await;
+
+            while let Some(pending) = sc.await_deferred() {
+                pending.await;
+            }
             owner.with(|| {
                 if let Some(prefetches) = prefetches.0.try_read_value().filter(|x| !x.is_empty()) {
                     let nonce =
