@@ -29,8 +29,9 @@ use std::{
 
 use any_spawner::PinnedFuture;
 use futures::{StreamExt as _, join};
-use leptos::{config::LeptosOptions, prelude::*};
+use leptos::{PrefetchLazyFn, WasmSplitManifest, config::LeptosOptions, prelude::*};
 use leptos_integration_utils::{BoxedFnOnce, PinnedStream};
+use leptos_meta::{Link, ServerMetaContext};
 use leptos_router::{
     Method, PathSegment, RouteList, RouteListing, SsrMode, static_routes::StaticRoute,
 };
@@ -145,15 +146,14 @@ impl StaticRouteGenerator {
         app_fn: impl Fn() -> IV + Clone + Send + 'static,
         additional_context: impl Fn() + Clone + Send + 'static,
     ) -> impl Future<Output = (Owner, String)> {
-        #[cfg(feature = "meta")]
         let (meta_context, meta_output) = leptos_meta::ServerMetaContext::new();
+        let prefetches = PrefetchLazyFn::default();
         let additional_context = {
+            let prefetches = prefetches.clone();
             move || {
                 provide_context(leptos_router::location::RequestUrl::new(path.as_ref()));
-                #[cfg(feature = "meta")]
-                {
-                    provide_context(meta_context);
-                }
+                provide_context(meta_context);
+                provide_context(prefetches);
                 additional_context();
             }
         };
@@ -163,19 +163,67 @@ impl StaticRouteGenerator {
             async_stream_builder,
             false,
         );
+        owner.with(|| provide_context(prefetches.clone()));
 
         let sc = owner.shared_context().unwrap();
 
         async move {
-            let await_pending = async move {
-                while let Some(pending) = sc.await_deferred() {
-                    pending.await;
+            let await_pending = {
+                let sc = sc.clone();
+                async move {
+                    while let Some(pending) = sc.await_deferred() {
+                        pending.await;
+                    }
                 }
             };
-            let (stream, _) = join!(stream, await_pending);
+            let (stream, ()) = join!(stream, await_pending);
+            owner.with(|| {
+                if let Some(prefetches) = prefetches.0.try_read_value().filter(|x| !x.is_empty()) {
+                    let nonce =
+                        use_nonce().map(|n| n.to_string()).unwrap_or_default();
+                    if let Some(manifest_read) =
+                        use_context::<WasmSplitManifest>().and_then(|m| m.0.try_read_value())
+                    {
+                        let (pkg_path, manifest, wasm_split_file) = &*manifest_read;
 
-            #[cfg(feature = "meta")]
-            let stream = meta_output.inject_meta_context(stream).await;
+                        let all_prefetches = prefetches
+                            .iter()
+                            .flat_map(|key| manifest.get(*key).into_iter().flatten());
+
+                        for module in all_prefetches {
+                            // to_html() on leptos_meta components registers them with the meta context,
+                            // rather than returning HTML directly
+                            _ = view! {
+                                <Link
+                                    rel="preload"
+                                    href=format!("{pkg_path}/{module}.wasm")
+                                    as_="fetch"
+                                    type_="application/wasm"
+                                    crossorigin=nonce.clone()
+                                />
+                            }
+                            .to_html();
+                        }
+                        _ = view! {
+                            <Link rel="modulepreload" href=format!("{pkg_path}/{wasm_split_file}") crossorigin=nonce/>
+                        }
+                        .to_html();
+                    }
+                }
+            });
+
+            let stream = Box::pin(meta_output.inject_meta_context(stream).await.then({
+                let sc = sc.clone();
+                move |chunk| {
+                    let sc = sc.clone();
+                    async move {
+                        while let Some(pending) = sc.await_deferred() {
+                            pending.await;
+                        }
+                        chunk
+                    }
+                }
+            }));
             let html = stream.collect::<String>().await;
             (owner, html)
         }
@@ -304,12 +352,8 @@ pub async fn generate_static_files_list<IV: IntoView + 'static>(
     init_executor()?;
     let _owner = Owner::new_root(Some(Arc::from(hydration_context::SsrSharedContext::new())));
     provide_context(leptos_router::location::RequestUrl::new(""));
-    #[cfg(feature = "meta")]
-    {
-        use leptos_meta::*;
-        let (mock_meta, _) = ServerMetaContext::new();
-        provide_context(mock_meta);
-    }
+    let (mock_meta, _) = ServerMetaContext::new();
+    provide_context(mock_meta);
     let (_, mock_writer) = signal(false);
     provide_context(NoGenerateStatic(mock_writer));
     additional_context();
